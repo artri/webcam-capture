@@ -1,19 +1,29 @@
 package com.github.sarxos.webcam;
 
 import static java.awt.RenderingHints.KEY_ANTIALIASING;
+import static java.awt.RenderingHints.KEY_INTERPOLATION;
+import static java.awt.RenderingHints.KEY_RENDERING;
 import static java.awt.RenderingHints.VALUE_ANTIALIAS_OFF;
 import static java.awt.RenderingHints.VALUE_ANTIALIAS_ON;
+import static java.awt.RenderingHints.VALUE_INTERPOLATION_BILINEAR;
+import static java.awt.RenderingHints.VALUE_RENDER_SPEED;
 
+import java.awt.AlphaComposite;
 import java.awt.BasicStroke;
 import java.awt.Color;
 import java.awt.Dimension;
 import java.awt.FontMetrics;
 import java.awt.Graphics;
 import java.awt.Graphics2D;
+import java.awt.GraphicsConfiguration;
+import java.awt.GraphicsEnvironment;
+import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
 import java.beans.PropertyChangeEvent;
 import java.beans.PropertyChangeListener;
+import java.util.HashMap;
 import java.util.Locale;
+import java.util.Map;
 import java.util.ResourceBundle;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
@@ -33,17 +43,17 @@ import org.slf4j.LoggerFactory;
 /**
  * Simply implementation of JPanel allowing users to render pictures taken with
  * webcam.
- * 
+ *
  * @author Bartosz Firyn (SarXos)
  */
 public class WebcamPanel extends JPanel implements WebcamListener, PropertyChangeListener {
 
 	/**
 	 * This enum is to control of how image will be drawn in the panel bounds.
-	 * 
+	 *
 	 * @author Sylwia Kauczor
 	 */
-	public static enum DrawMode {
+	public enum DrawMode {
 
 		/**
 		 * Do not resize image - paint it as it is. This will make the image to
@@ -66,21 +76,24 @@ public class WebcamPanel extends JPanel implements WebcamListener, PropertyChang
 
 	/**
 	 * Interface of the painter used to draw image in panel.
-	 * 
+	 *
 	 * @author Bartosz Firyn (SarXos)
 	 */
-	public static interface Painter {
+	public interface Painter {
 
 		/**
-		 * Paints panel without image.
-		 * 
+		 * Paint panel without image.
+		 *
+		 * @param panel the webcam panel to paint on
 		 * @param g2 the graphics 2D object used for drawing
 		 */
 		void paintPanel(WebcamPanel panel, Graphics2D g2);
 
 		/**
-		 * Paints webcam image in panel.
-		 * 
+		 * Paint webcam image in panel.
+		 *
+		 * @param panel the webcam panel to paint on
+		 * @param image the image from webcam
 		 * @param g2 the graphics 2D object used for drawing
 		 */
 		void paintImage(WebcamPanel panel, BufferedImage image, Graphics2D g2);
@@ -88,13 +101,26 @@ public class WebcamPanel extends JPanel implements WebcamListener, PropertyChang
 
 	/**
 	 * Default painter used to draw image in panel.
-	 * 
+	 *
 	 * @author Bartosz Firyn (SarXos)
 	 * @author Sylwia Kauczor
 	 */
 	public class DefaultPainter implements Painter {
 
+		/**
+		 * Webcam device name.
+		 */
 		private String name = null;
+
+		/**
+		 * Lat repaint time, uset for debug purpose.
+		 */
+		private long lastRepaintTime = -1;
+
+		/**
+		 * Buffered image resized to fit into panel drawing area.
+		 */
+		private BufferedImage resizedImage = null;
 
 		@Override
 		public void paintPanel(WebcamPanel owner, Graphics2D g2) {
@@ -130,7 +156,7 @@ public class WebcamPanel extends JPanel implements WebcamListener, PropertyChang
 			g2.drawLine(0, 0, getWidth(), getHeight());
 			g2.drawLine(0, getHeight(), getWidth(), 0);
 
-			String str = null;
+			String str;
 
 			final String strInitDevice = rb.getString("INITIALIZING_DEVICE");
 			final String strNoImage = rb.getString("NO_IMAGE");
@@ -173,24 +199,34 @@ public class WebcamPanel extends JPanel implements WebcamListener, PropertyChang
 			assert image != null;
 			assert g2 != null;
 
-			Object antialiasing = g2.getRenderingHint(KEY_ANTIALIASING);
-
-			g2.setRenderingHint(KEY_ANTIALIASING, isAntialiasingEnabled() ? VALUE_ANTIALIAS_ON : VALUE_ANTIALIAS_OFF);
-
 			int pw = getWidth();
 			int ph = getHeight();
 			int iw = image.getWidth();
 			int ih = image.getHeight();
 
+			Object antialiasing = g2.getRenderingHint(KEY_ANTIALIASING);
+			Object rendering = g2.getRenderingHint(KEY_RENDERING);
+
+			g2.setRenderingHint(KEY_ANTIALIASING, VALUE_ANTIALIAS_OFF);
+			g2.setRenderingHint(KEY_RENDERING, VALUE_RENDER_SPEED);
 			g2.setBackground(Color.BLACK);
+			g2.setColor(Color.BLACK);
 			g2.fillRect(0, 0, pw, ph);
+
+			// resized image position and size
+			int x = 0;
+			int y = 0;
+			int w = 0;
+			int h = 0;
 
 			switch (drawMode) {
 				case NONE:
-					g2.drawImage(image, 0, 0, null);
+					w = image.getWidth();
+					h = image.getHeight();
 					break;
 				case FILL:
-					g2.drawImage(image, 0, 0, pw, ph, null);
+					w = pw;
+					h = ph;
 					break;
 				case FIT:
 					double s = Math.max((double) iw / pw, (double) ih / ph);
@@ -198,25 +234,82 @@ public class WebcamPanel extends JPanel implements WebcamListener, PropertyChang
 					double nih = ih / s;
 					double dx = (pw - niw) / 2;
 					double dy = (ph - nih) / 2;
-					g2.drawImage(image, (int) dx, (int) dy, (int) niw, (int) nih, null);
+					w = (int) niw;
+					h = (int) nih;
+					x = (int) dx;
+					y = (int) dy;
 					break;
-				default:
-					g2.setRenderingHint(KEY_ANTIALIASING, antialiasing);
-					throw new RuntimeException("Mode " + drawMode + " not supported");
 			}
+
+			if (resizedImage != null) {
+				resizedImage.flush();
+			}
+
+			if (w == image.getWidth() && h == image.getHeight() && !mirrored) {
+				resizedImage = image;
+			} else {
+
+				GraphicsEnvironment genv = GraphicsEnvironment.getLocalGraphicsEnvironment();
+				GraphicsConfiguration gc = genv.getDefaultScreenDevice().getDefaultConfiguration();
+
+				Graphics2D gr = null;
+				try {
+
+					resizedImage = gc.createCompatibleImage(pw, ph);
+					gr = resizedImage.createGraphics();
+					gr.setComposite(AlphaComposite.Src);
+
+					for (Map.Entry<RenderingHints.Key, Object> hint : imageRenderingHints.entrySet()) {
+						gr.setRenderingHint(hint.getKey(), hint.getValue());
+					}
+
+					gr.setBackground(Color.BLACK);
+					gr.setColor(Color.BLACK);
+					gr.fillRect(0, 0, pw, ph);
+
+					int sx1, sx2, sy1, sy2; // source rectangle coordinates
+					int dx1, dx2, dy1, dy2; // destination rectangle coordinates
+
+					dx1 = x;
+					dy1 = y;
+					dx2 = x + w;
+					dy2 = y + h;
+
+					if (mirrored) {
+						sx1 = iw;
+						sy1 = 0;
+						sx2 = 0;
+						sy2 = ih;
+					} else {
+						sx1 = 0;
+						sy1 = 0;
+						sx2 = iw;
+						sy2 = ih;
+					}
+
+					gr.drawImage(image, dx1, dy1, dx2, dy2, sx1, sy1, sx2, sy2, null);
+
+				} finally {
+					if (gr != null) {
+						gr.dispose();
+					}
+				}
+			}
+
+			g2.drawImage(resizedImage, 0, 0, null);
 
 			if (isFPSDisplayed()) {
 
 				String str = String.format("FPS: %.1f", webcam.getFPS());
 
-				int x = 5;
-				int y = ph - 5;
+				int sx = 5;
+				int sy = ph - 5;
 
 				g2.setFont(getFont());
 				g2.setColor(Color.BLACK);
-				g2.drawString(str, x + 1, y + 1);
+				g2.drawString(str, sx + 1, sy + 1);
 				g2.setColor(Color.WHITE);
-				g2.drawString(str, x, y);
+				g2.drawString(str, sx, sy);
 			}
 
 			if (isImageSizeDisplayed()) {
@@ -225,17 +318,35 @@ public class WebcamPanel extends JPanel implements WebcamListener, PropertyChang
 
 				FontMetrics metrics = g2.getFontMetrics(getFont());
 				int sw = metrics.stringWidth(res);
-				int x = pw - sw - 5;
-				int y = ph - 5;
+				int sx = pw - sw - 5;
+				int sy = ph - 5;
 
 				g2.setFont(getFont());
 				g2.setColor(Color.BLACK);
-				g2.drawString(res, x + 1, y + 1);
+				g2.drawString(res, sx + 1, sy + 1);
 				g2.setColor(Color.WHITE);
-				g2.drawString(res, x, y);
+				g2.drawString(res, sx, sy);
+			}
+
+			if (isDisplayDebugInfo()) {
+
+				if (lastRepaintTime < 0) {
+					lastRepaintTime = System.currentTimeMillis();
+				} else {
+
+					long now = System.currentTimeMillis();
+					String res = String.format("DEBUG: repaints per second: %.1f", (double) 1000 / (now - lastRepaintTime));
+					lastRepaintTime = now;
+					g2.setFont(getFont());
+					g2.setColor(Color.BLACK);
+					g2.drawString(res, 6, 16);
+					g2.setColor(Color.WHITE);
+					g2.drawString(res, 5, 15);
+				}
 			}
 
 			g2.setRenderingHint(KEY_ANTIALIASING, antialiasing);
+			g2.setRenderingHint(KEY_RENDERING, rendering);
 		}
 	}
 
@@ -250,7 +361,6 @@ public class WebcamPanel extends JPanel implements WebcamListener, PropertyChang
 			t.setDaemon(true);
 			return t;
 		}
-
 	}
 
 	/**
@@ -295,10 +405,22 @@ public class WebcamPanel extends JPanel implements WebcamListener, PropertyChang
 	 */
 	private static final ThreadFactory THREAD_FACTORY = new PanelThreadFactory();
 
+	public static final Map<RenderingHints.Key, Object> DEFAULT_IMAGE_RENDERING_HINTS = new HashMap<RenderingHints.Key, Object>();
+	static {
+		DEFAULT_IMAGE_RENDERING_HINTS.put(KEY_INTERPOLATION, VALUE_INTERPOLATION_BILINEAR);
+		DEFAULT_IMAGE_RENDERING_HINTS.put(KEY_RENDERING, VALUE_RENDER_SPEED);
+		DEFAULT_IMAGE_RENDERING_HINTS.put(KEY_ANTIALIASING, VALUE_ANTIALIAS_ON);
+	}
+
 	/**
 	 * This runnable will do nothing more than repaint panel.
 	 */
 	private final Runnable repaint = new SwingRepainter(this);
+
+	/**
+	 * Rendering hints to be used when painting image to be displayed.
+	 */
+	private Map<RenderingHints.Key, Object> imageRenderingHints = new HashMap<RenderingHints.Key, Object>(DEFAULT_IMAGE_RENDERING_HINTS);
 
 	/**
 	 * Scheduled executor acting as timer.
@@ -307,14 +429,14 @@ public class WebcamPanel extends JPanel implements WebcamListener, PropertyChang
 
 	/**
 	 * Image updater reads images from camera and force panel to be repainted.
-	 * 
+	 *
 	 * @author Bartosz Firyn (SarXos)
 	 */
 	private class ImageUpdater implements Runnable {
 
 		/**
 		 * Repaint scheduler schedule panel updates.
-		 * 
+		 *
 		 * @author Bartosz Firyn (sarxos)
 		 */
 		private class RepaintScheduler extends Thread {
@@ -351,13 +473,12 @@ public class WebcamPanel extends JPanel implements WebcamListener, PropertyChang
 				// second scheduler execution
 
 				try {
-					if (webcam.isOpen()) {
 
-						// FPS limit means that panel rendering frequency is
-						// limited
-						// to the specific value and panel will not be rendered
-						// more
-						// often then specific value
+					// FPS limit means that panel rendering frequency is
+					// limited to the specific value and panel will not be
+					// rendered more often then specific value
+
+					if (webcam.isOpen()) {
 
 						// TODO: rename FPS value in panel to rendering
 						// frequency
@@ -377,9 +498,7 @@ public class WebcamPanel extends JPanel implements WebcamListener, PropertyChang
 					// completely started (it was in "starting" timeframe)
 
 					LOG.warn("Executor rejected paint update");
-					LOG.debug("Executor rejected paint update because of", e);
-
-					return;
+					LOG.trace("Executor rejected paint update because of", e);
 				}
 			}
 		}
@@ -409,7 +528,7 @@ public class WebcamPanel extends JPanel implements WebcamListener, PropertyChang
 		/**
 		 * Stop repainter. Can be invoked many times, but only first call will
 		 * take effect.
-		 * 
+		 *
 		 * @throws InterruptedException
 		 */
 		public void stop() throws InterruptedException {
@@ -472,7 +591,7 @@ public class WebcamPanel extends JPanel implements WebcamListener, PropertyChang
 	/**
 	 * The mode of how the image will be resized to fit into panel bounds.
 	 * Default is {@link DrawMode#FIT}
-	 * 
+	 *
 	 * @see DrawMode
 	 */
 	private DrawMode drawMode = DrawMode.FIT;
@@ -547,7 +666,7 @@ public class WebcamPanel extends JPanel implements WebcamListener, PropertyChang
 
 	/**
 	 * Painter used to draw image in panel.
-	 * 
+	 *
 	 * @see #setPainter(Painter)
 	 * @see #getPainter()
 	 */
@@ -559,8 +678,18 @@ public class WebcamPanel extends JPanel implements WebcamListener, PropertyChang
 	private Dimension defaultSize = null;
 
 	/**
+	 * If debug info should be displayed.
+	 */
+	private boolean displayDebugInfo = false;
+
+	/**
+	 * Is image mirrored.
+	 */
+	private boolean mirrored = false;
+
+	/**
 	 * Creates webcam panel and automatically start webcam.
-	 * 
+	 *
 	 * @param webcam the webcam to be used to fetch images
 	 */
 	public WebcamPanel(Webcam webcam) {
@@ -570,7 +699,7 @@ public class WebcamPanel extends JPanel implements WebcamListener, PropertyChang
 	/**
 	 * Creates new webcam panel which display image from camera in you your
 	 * Swing application.
-	 * 
+	 *
 	 * @param webcam the webcam to be used to fetch images
 	 * @param start true if webcam shall be automatically started
 	 */
@@ -584,7 +713,7 @@ public class WebcamPanel extends JPanel implements WebcamListener, PropertyChang
 	 * be used. If you would like to fill panel area with image even if its size
 	 * is different, then you can use {@link WebcamPanel#setFillArea(boolean)}
 	 * method to configure this.
-	 * 
+	 *
 	 * @param webcam the webcam to be used to fetch images
 	 * @param size the size of panel
 	 * @param start true if webcam shall be automatically started
@@ -622,7 +751,7 @@ public class WebcamPanel extends JPanel implements WebcamListener, PropertyChang
 
 	/**
 	 * Set new painter. Painter is a class which pains image visible when
-	 * 
+	 *
 	 * @param painter the painter object to be set
 	 */
 	public void setPainter(Painter painter) {
@@ -631,7 +760,7 @@ public class WebcamPanel extends JPanel implements WebcamListener, PropertyChang
 
 	/**
 	 * Get painter used to draw image in webcam panel.
-	 * 
+	 *
 	 * @return Painter object
 	 */
 	public Painter getPainter() {
@@ -640,11 +769,13 @@ public class WebcamPanel extends JPanel implements WebcamListener, PropertyChang
 
 	@Override
 	protected void paintComponent(Graphics g) {
-		Graphics2D g2 = (Graphics2D) g;
+
+		super.paintComponent(g);
+
 		if (image == null) {
-			painter.paintPanel(this, g2);
+			painter.paintPanel(this, (Graphics2D) g);
 		} else {
-			painter.paintImage(this, image, g2);
+			painter.paintImage(this, image, (Graphics2D) g);
 		}
 	}
 
@@ -747,7 +878,7 @@ public class WebcamPanel extends JPanel implements WebcamListener, PropertyChang
 
 	/**
 	 * Is frequency limit enabled?
-	 * 
+	 *
 	 * @return True or false
 	 */
 	public boolean isFPSLimited() {
@@ -759,8 +890,8 @@ public class WebcamPanel extends JPanel implements WebcamListener, PropertyChang
 	 * <b>all IP cameras working in pull mode</b> (to save number of HTTP
 	 * requests). If true, images will be fetched in configured time intervals.
 	 * If false, images will be fetched as fast as camera can serve them.
-	 * 
-	 * @param frequencyLimit
+	 *
+	 * @param frequencyLimit true if limiting the frequency of image requests
 	 */
 	public void setFPSLimited(boolean frequencyLimit) {
 		this.frequencyLimit = frequencyLimit;
@@ -768,7 +899,7 @@ public class WebcamPanel extends JPanel implements WebcamListener, PropertyChang
 
 	/**
 	 * Get rendering frequency in FPS (equivalent to Hz).
-	 * 
+	 *
 	 * @return Rendering frequency
 	 */
 	public double getFPSLimit() {
@@ -778,7 +909,7 @@ public class WebcamPanel extends JPanel implements WebcamListener, PropertyChang
 	/**
 	 * Set rendering frequency (in Hz or FPS). Minimum frequency is 0.016 (1
 	 * frame per minute) and maximum is 25 (25 frames per second).
-	 * 
+	 *
 	 * @param fps the frequency
 	 */
 	public void setFPSLimit(double fps) {
@@ -791,25 +922,68 @@ public class WebcamPanel extends JPanel implements WebcamListener, PropertyChang
 		this.frequency = fps;
 	}
 
+	/**
+	 * Is displaying of some debug information enabled.
+	 *
+	 * @return True if debug information are enabled, false otherwise
+	 */
+	public boolean isDisplayDebugInfo() {
+		return displayDebugInfo;
+	}
+
+	/**
+	 * Display some debug information on image surface.
+	 *
+	 * @param displayDebugInfo the value to control debug information
+	 */
+	public void setDisplayDebugInfo(boolean displayDebugInfo) {
+		this.displayDebugInfo = displayDebugInfo;
+	}
+
+	/**
+	 * This method return true in case if camera FPS is set to be displayed on
+	 * panel surface. Default value returned is false.
+	 *
+	 * @return True if camera FPS is set to be displayed on panel surface
+	 * @see #setFPSDisplayed(boolean)
+	 */
 	public boolean isFPSDisplayed() {
 		return frequencyDisplayed;
 	}
 
+	/**
+	 * This method is to control if camera FPS should be displayed on the webcam
+	 * panel surface.
+	 *
+	 * @param displayed the value to control if camera FPS should be displayed
+	 */
 	public void setFPSDisplayed(boolean displayed) {
 		this.frequencyDisplayed = displayed;
 	}
 
+	/**
+	 * This method will return true in case when panel is configured to display
+	 * image size. The string will be printed in the right bottom corner of the
+	 * panel surface.
+	 *
+	 * @return True in case if panel is configured to display image size
+	 */
 	public boolean isImageSizeDisplayed() {
 		return imageSizeDisplayed;
 	}
 
+	/**
+	 * Configure panel to display camera image size to be displayed.
+	 *
+	 * @param imageSizeDisplayed if true the pixel dimensions are displayed over the image.
+	 */
 	public void setImageSizeDisplayed(boolean imageSizeDisplayed) {
 		this.imageSizeDisplayed = imageSizeDisplayed;
 	}
 
 	/**
 	 * Turn on/off antialiasing.
-	 * 
+	 *
 	 * @param antialiasing the true to enable, false to disable antialiasing
 	 */
 	public void setAntialiasingEnabled(boolean antialiasing) {
@@ -825,7 +999,7 @@ public class WebcamPanel extends JPanel implements WebcamListener, PropertyChang
 
 	/**
 	 * Is webcam panel repainting starting.
-	 * 
+	 *
 	 * @return True if panel is starting
 	 */
 	public boolean isStarting() {
@@ -834,13 +1008,47 @@ public class WebcamPanel extends JPanel implements WebcamListener, PropertyChang
 
 	/**
 	 * Is webcam panel repainting started.
-	 * 
+	 *
 	 * @return True if panel repainting has been started
 	 */
 	public boolean isStarted() {
 		return started.get();
 	}
 
+	/**
+	 * This method returns the current draw mode, mainly used by custom painters
+	 * @return the current value of the {@link DrawMode}
+     */
+    public DrawMode getDrawMode(){
+		return this.drawMode;
+	}
+
+	/**
+	 * This method sets the drawmode
+	 * @param drawMode the desired {@link DrawMode}
+     */
+	public void setDrawMode(DrawMode drawMode){
+		this.drawMode = drawMode;
+	}
+
+	/**
+	 * Indicates whether the panel is in an error state
+	 * @return true if the panel has an error present
+     */
+	public boolean isErrored(){
+		return errored;
+	}
+
+	/**
+	 * Hints for rendering, mainly used for custom painters
+	 * @return the stored RenderingHints
+	 * @deprecated use {@link #getDrawMode()}  instead.
+     */
+	public Map<RenderingHints.Key, Object> getImageRenderingHints() {
+		return imageRenderingHints;
+	}
+
+	@Deprecated
 	public boolean isFitArea() {
 		return drawMode == DrawMode.FIT;
 	}
@@ -850,9 +1058,11 @@ public class WebcamPanel extends JPanel implements WebcamListener, PropertyChang
 	 * be resized and will keep scale factor to fit into drawable panel bounds.
 	 * When set to false, the mode will be reset to {@link DrawMode#NONE} so
 	 * image will be drawn as it is.
-	 * 
+	 *
 	 * @param fitArea the fit area mode enabled or disabled
+	 * @deprecated use {@link #setDrawMode(DrawMode drawMode)}  instead.
 	 */
+	@Deprecated
 	public void setFitArea(boolean fitArea) {
 		this.drawMode = fitArea ? DrawMode.FIT : DrawMode.NONE;
 	}
@@ -860,9 +1070,11 @@ public class WebcamPanel extends JPanel implements WebcamListener, PropertyChang
 	/**
 	 * Image will be resized to fill panel area if true. If false then image
 	 * will be rendered as it was obtained from webcam instance.
-	 * 
+	 *
 	 * @param fillArea shall image be resided to fill panel area
+	 * @deprecated use {@link #setDrawMode(DrawMode drawMode)}  instead.
 	 */
+	@Deprecated
 	public void setFillArea(boolean fillArea) {
 		this.drawMode = fillArea ? DrawMode.FILL : DrawMode.NONE;
 	}
@@ -871,16 +1083,18 @@ public class WebcamPanel extends JPanel implements WebcamListener, PropertyChang
 	 * Get value of fill area setting. Image will be resized to fill panel area
 	 * if true. If false then image will be rendered as it was obtained from
 	 * webcam instance.
-	 * 
+	 *
 	 * @return True if image is being resized, false otherwise
+	 * @deprecated use {@link #getDrawMode()}  instead.
 	 */
+	@Deprecated
 	public boolean isFillArea() {
 		return drawMode == DrawMode.FILL;
 	}
 
 	/**
 	 * Get default painter used to draw panel.
-	 * 
+	 *
 	 * @return Default painter
 	 */
 	public Painter getDefaultPainter() {
@@ -919,5 +1133,34 @@ public class WebcamPanel extends JPanel implements WebcamListener, PropertyChang
 	@Override
 	public void webcamImageObtained(WebcamEvent we) {
 		// do nothing
+	}
+
+	/**
+	 * This method returns true if image mirroring is enabled. The default value
+	 * is false.
+	 *
+	 * @return True if image is mirrored, false otherwise
+	 */
+	public boolean isMirrored() {
+		return mirrored;
+	}
+
+	/**
+	 * Decide whether or not the image from webcam painted on panel surface will
+	 * be mirrored. The image from camera itself is not modified.
+	 *
+	 * @param mirrored the parameter to control if image should be mirrored
+	 */
+	public void setMirrored(boolean mirrored) {
+		this.mirrored = mirrored;
+	}
+
+	/**
+	 * Return {@link Webcam} used by this panel.
+	 * 
+	 * @return {@link Webcam}
+	 */
+	public Webcam getWebcam() {
+		return webcam;
 	}
 }

@@ -3,6 +3,7 @@ package com.github.sarxos.webcam;
 import java.awt.Dimension;
 import java.awt.image.BufferedImage;
 import java.nio.ByteBuffer;
+import java.util.Map;
 
 
 /**
@@ -22,12 +23,26 @@ public interface WebcamDevice {
 	public static interface BufferAccess {
 
 		/**
-		 * Get image in form of raw bytes. Do <b>not</b> use this buffer to set
-		 * bytes value, it should be used only for read purpose!
+		 * Read the underlying image memory buffer. This method will return new
+		 * reference to pre-allocated off-heap memory where image bytes are
+		 * stored. The size of this buffer is image width * height * 3 bytes.<br>
+		 * <br>
+		 * 
+		 * <b>NOTE!</b> Do <b>not</b> use this buffer to set bytes value. It
+		 * should be used only for read purpose!
 		 * 
 		 * @return Bytes buffer
 		 */
 		ByteBuffer getImageBytes();
+
+		/**
+		 * Copy the underlying image memory into the target buffer passed as the
+		 * argument.The remaining capacity of the target buffer needs to be at
+		 * least image width * height * 3 bytes.
+		 * 
+		 * @param target the buffer to which image data should be copied
+		 */
+		void getImageBytes(ByteBuffer target);
 
 	}
 
@@ -42,6 +57,27 @@ public interface WebcamDevice {
 
 	}
 
+	/**
+	 * This interface may be implemented by devices which expect any specific
+	 * parameters.
+	 * 
+	 * @author Martin Krok (krok32) 
+	 */
+	public static interface Configurable {
+
+		/**
+		 * Sets device parameters. Each device implementation may accept its own
+		 * set of parameters. All accepted keys, value types, possible values
+		 * and defaults should be reasonably documented by the implementor. May
+		 * be called before the open method or later in dependence of the device
+		 * implementation.
+		 * 
+		 * @param parameters - Map of parameters changing device defaults
+		 * @see Webcam#setParameters(Map)
+		 */
+		void setParameters(Map<String, ?> parameters);
+	}
+	
 	/**
 	 * Get device name.
 	 * 

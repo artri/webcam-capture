@@ -18,17 +18,29 @@ public class WebcamProcessor {
 	private static final Logger LOG = LoggerFactory.getLogger(WebcamProcessor.class);
 
 	/**
+	 * Thread doing supersync processing.
+	 *
+	 * @author sarxos
+	 */
+	public static final class ProcessorThread extends Thread {
+
+		private static final AtomicInteger N = new AtomicInteger(0);
+
+		public ProcessorThread(Runnable r) {
+			super(r, String.format("atomic-processor-%d", N.incrementAndGet()));
+		}
+	}
+
+	/**
 	 * Thread factory for processor.
-	 * 
+	 *
 	 * @author Bartosz Firyn (SarXos)
 	 */
 	private static final class ProcessorThreadFactory implements ThreadFactory {
 
-		private static final AtomicInteger N = new AtomicInteger(0);
-
 		@Override
 		public Thread newThread(Runnable r) {
-			Thread t = new Thread(r, String.format("atomic-processor-%d", N.incrementAndGet()));
+			Thread t = new ProcessorThread(r);
 			t.setUncaughtExceptionHandler(WebcamExceptionHandler.getInstance());
 			t.setDaemon(true);
 			return t;
@@ -36,10 +48,9 @@ public class WebcamProcessor {
 	}
 
 	/**
-	 * Heart of overall processing system. This class process all native calls
-	 * wrapped in tasks, by doing this all tasks executions are
-	 * super-synchronized.
-	 * 
+	 * Heart of overall processing system. This class process all native calls wrapped in tasks, by
+	 * doing this all tasks executions are super-synchronized.
+	 *
 	 * @author Bartosz Firyn (SarXos)
 	 */
 	private static final class AtomicProcessor implements Runnable {
@@ -49,9 +60,8 @@ public class WebcamProcessor {
 
 		/**
 		 * Process task.
-		 * 
+		 *
 		 * @param task the task to be processed
-		 * @return Processed task
 		 * @throws InterruptedException when thread has been interrupted
 		 */
 		public void process(WebcamTask task) throws InterruptedException {
@@ -115,7 +125,7 @@ public class WebcamProcessor {
 
 	/**
 	 * Process single webcam task.
-	 * 
+	 *
 	 * @param task the task to be processed
 	 * @throws InterruptedException when thread has been interrupted
 	 */

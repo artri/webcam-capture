@@ -14,7 +14,6 @@ import java.awt.image.WritableRaster;
 import java.nio.ByteBuffer;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 
 import org.bridj.Pointer;
 import org.slf4j.Logger;
@@ -39,8 +38,13 @@ public class WebcamDefaultDevice implements WebcamDevice, BufferAccess, Runnable
 	private static final Logger LOG = LoggerFactory.getLogger(WebcamDefaultDevice.class);
 
 	/**
-	 * Artificial view sizes. I'm really not sure if will fit into other webcams
-	 * but hope that OpenIMAJ can handle this.
+	 * The device memory buffer size.
+	 */
+	private static final int DEVICE_BUFFER_SIZE = 5;
+
+	/**
+	 * Artificial view sizes. I'm really not sure if will fit into other webcams but hope that
+	 * OpenIMAJ can handle this.
 	 */
 	private final static Dimension[] DIMENSIONS = new Dimension[] {
 		WebcamResolution.QQVGA.getSize(),
@@ -73,8 +77,8 @@ public class WebcamDefaultDevice implements WebcamDevice, BufferAccess, Runnable
 				return;
 			}
 
-			grabber.setTimeout(timeout);
 			result.set(grabber.nextFrame());
+			fresh.set(true);
 		}
 	}
 
@@ -119,9 +123,9 @@ public class WebcamDefaultDevice implements WebcamDevice, BufferAccess, Runnable
 	private final AtomicBoolean open = new AtomicBoolean(false);
 
 	/**
-	 * When last frame was requested.
+	 * Is the last image fresh one.
 	 */
-	private final AtomicLong timestamp = new AtomicLong(-1);
+	private final AtomicBoolean fresh = new AtomicBoolean(false);
 
 	private Thread refresher = null;
 
@@ -132,6 +136,9 @@ public class WebcamDefaultDevice implements WebcamDevice, BufferAccess, Runnable
 	private long t1 = -1;
 	private long t2 = -1;
 
+	/**
+	 * Current FPS.
+	 */
 	private volatile double fps = 0;
 
 	protected WebcamDefaultDevice(Device device) {
@@ -144,6 +151,18 @@ public class WebcamDefaultDevice implements WebcamDevice, BufferAccess, Runnable
 	@Override
 	public String getName() {
 		return fullname;
+	}
+
+	public String getDeviceName() {
+		return name;
+	}
+
+	public String getDeviceId() {
+		return id;
+	}
+
+	public Device getDeviceRef() {
+		return device;
 	}
 
 	@Override
@@ -180,17 +199,24 @@ public class WebcamDefaultDevice implements WebcamDevice, BufferAccess, Runnable
 			LOG.debug("Webcam is disposed, image will be null");
 			return null;
 		}
-
 		if (!open.get()) {
 			LOG.debug("Webcam is closed, image will be null");
 			return null;
 		}
 
-		LOG.trace("Webcam device get image (next frame)");
+		// if image is not fresh, update it
+
+		if (fresh.compareAndSet(false, true)) {
+			updateFrameBuffer();
+		}
 
 		// get image buffer
 
+		LOG.trace("Webcam grabber get image pointer");
+
 		Pointer<Byte> image = grabber.getImage();
+		fresh.set(false);
+
 		if (image == null) {
 			LOG.warn("Null array pointer found instead of image");
 			return null;
@@ -201,6 +227,50 @@ public class WebcamDefaultDevice implements WebcamDevice, BufferAccess, Runnable
 		LOG.trace("Webcam device get buffer, read {} bytes", length);
 
 		return image.getByteBuffer(length);
+	}
+
+	@Override
+	public void getImageBytes(ByteBuffer target) {
+
+		if (disposed.get()) {
+			LOG.debug("Webcam is disposed, image will be null");
+			return;
+		}
+		if (!open.get()) {
+			LOG.debug("Webcam is closed, image will be null");
+			return;
+		}
+
+		int minSize = size.width * size.height * 3;
+		int curSize = target.remaining();
+
+		if (minSize < curSize) {
+			throw new IllegalArgumentException(String.format("Not enough remaining space in target buffer (%d necessary vs %d remaining)", minSize, curSize));
+		}
+
+		// if image is not fresh, update it
+
+		if (fresh.compareAndSet(false, true)) {
+			updateFrameBuffer();
+		}
+
+		// get image buffer
+
+		LOG.trace("Webcam grabber get image pointer");
+
+		Pointer<Byte> image = grabber.getImage();
+		fresh.set(false);
+
+		if (image == null) {
+			LOG.warn("Null array pointer found instead of image");
+			return;
+		}
+
+		LOG.trace("Webcam device read buffer {} bytes", minSize);
+
+		image = image.validBytes(minSize);
+		image.getBytes(target);
+
 	}
 
 	@Override
@@ -264,6 +334,11 @@ public class WebcamDefaultDevice implements WebcamDevice, BufferAccess, Runnable
 			throw new WebcamException("Cannot start native grabber!");
 		}
 
+		// set timeout, this MUST be done after grabber is open and before it's closed, otherwise it
+		// will result as crash
+
+		grabber.setTimeout(timeout);
+
 		LOG.debug("Webcam device session started");
 
 		Dimension size2 = new Dimension(grabber.getWidth(), grabber.getHeight());
@@ -279,38 +354,53 @@ public class WebcamDefaultDevice implements WebcamDevice, BufferAccess, Runnable
 				throw new WebcamException(String.format("Different size obtained vs requested - [%dx%d] vs [%dx%d]", w1, h1, w2, h2));
 			}
 
-			LOG.warn("Different size obtained vs requested - [{}x{}] vs [{}x{}]. Setting correct one. New size is [{}x{}]", new Object[] { w1, h1, w2, h2, w2, h2 });
+			Object[] args = new Object[] { w1, h1, w2, h2, w2, h2 };
+			LOG.warn("Different size obtained vs requested - [{}x{}] vs [{}x{}]. Setting correct one. New size is [{}x{}]", args);
+
 			size = new Dimension(w2, h2);
 		}
 
 		smodel = new ComponentSampleModel(DATA_TYPE, size.width, size.height, 3, size.width * 3, BAND_OFFSETS);
 		cmodel = new ComponentColorModel(COLOR_SPACE, BITS, false, false, Transparency.OPAQUE, DATA_TYPE);
 
-		LOG.debug("Initialize buffer");
+		// clear device memory buffer
 
-		int i = 0;
-		do {
+		LOG.debug("Clear memory buffer");
 
-			grabber.nextFrame();
+		clearMemoryBuffer();
 
-			try {
-				Thread.sleep(1000);
-			} catch (InterruptedException e) {
-				LOG.error("Nasty interrupted exception", e);
-			}
-
-		} while (++i < 3);
-
-		timestamp.set(System.currentTimeMillis());
+		// set device to open
 
 		LOG.debug("Webcam device {} is now open", this);
 
 		open.set(true);
 
-		refresher = new Thread(this, String.format("frames-refresher:%s", id));
+		// start underlying frames refresher
+
+		refresher = startFramesRefresher();
+	}
+
+	/**
+	 * this is to clean up all frames from device memory buffer which causes initial frames to be
+	 * completely blank (black images)
+	 */
+	private void clearMemoryBuffer() {
+		for (int i = 0; i < DEVICE_BUFFER_SIZE; i++) {
+			grabber.nextFrame();
+		}
+	}
+
+	/**
+	 * Start underlying frames refresher.
+	 * 
+	 * @return Refresher thread
+	 */
+	private Thread startFramesRefresher() {
+		Thread refresher = new Thread(this, String.format("frames-refresher-[%s]", id));
 		refresher.setUncaughtExceptionHandler(WebcamExceptionHandler.getInstance());
 		refresher.setDaemon(true);
 		refresher.start();
+		return refresher;
 	}
 
 	@Override
@@ -338,8 +428,8 @@ public class WebcamDefaultDevice implements WebcamDevice, BufferAccess, Runnable
 	}
 
 	/**
-	 * Determines if device should fail when requested image size is different
-	 * than actually received.
+	 * Determines if device should fail when requested image size is different than actually
+	 * received.
 	 * 
 	 * @param fail the fail on size mismatch flag, true or false
 	 */
@@ -367,13 +457,40 @@ public class WebcamDefaultDevice implements WebcamDevice, BufferAccess, Runnable
 	 * @param timeout the timeout value in milliseconds
 	 */
 	public void setTimeout(int timeout) {
+		if (isOpen()) {
+			throw new WebcamException("Timeout must be set before webcam is open");
+		}
 		this.timeout = timeout;
+	}
+
+	/**
+	 * Update underlying memory buffer and fetch new frame.
+	 */
+	private void updateFrameBuffer() {
+
+		LOG.trace("Next frame");
+
+		if (t1 == -1 || t2 == -1) {
+			t1 = System.currentTimeMillis();
+			t2 = System.currentTimeMillis();
+		}
+
+		int result = new NextFrameTask(this).nextFrame();
+
+		t1 = t2;
+		t2 = System.currentTimeMillis();
+
+		fps = (4 * fps + 1000 / (t2 - t1 + 1)) / 5;
+
+		if (result == -1) {
+			LOG.error("Timeout when requesting image!");
+		} else if (result < -1) {
+			LOG.error("Error requesting new frame!");
+		}
 	}
 
 	@Override
 	public void run() {
-
-		int result = -1;
 
 		do {
 
@@ -387,27 +504,7 @@ public class WebcamDefaultDevice implements WebcamDevice, BufferAccess, Runnable
 				return;
 			}
 
-			LOG.trace("Next frame");
-
-			if (t1 == -1 || t2 == -1) {
-				t1 = System.currentTimeMillis();
-				t2 = System.currentTimeMillis();
-			}
-
-			result = new NextFrameTask(this).nextFrame();
-
-			t1 = t2;
-			t2 = System.currentTimeMillis();
-
-			fps = (4 * fps + 1000 / (t2 - t1 + 1)) / 5;
-
-			if (result == -1) {
-				LOG.error("Timeout when requesting image!");
-			} else if (result < -1) {
-				LOG.error("Error requesting new frame!");
-			}
-
-			timestamp.set(System.currentTimeMillis());
+			updateFrameBuffer();
 
 		} while (open.get());
 	}

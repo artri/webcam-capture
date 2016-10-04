@@ -13,13 +13,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.github.sarxos.webcam.util.jh.JHBlurFilter;
-import com.github.sarxos.webcam.util.jh.JHGrayFilter;
-
 
 /**
  * Webcam motion detector.
- * 
+ *
  * @author Bartosz Firyn (SarXos)
  */
 public class WebcamMotionDetector {
@@ -40,23 +37,13 @@ public class WebcamMotionDetector {
 	private static final ThreadFactory THREAD_FACTORY = new DetectorThreadFactory();
 
 	/**
-	 * Default pixel difference intensity threshold (set to 25).
+	 * Default check interval, in milliseconds, set to 500 ms.
 	 */
-	public static final int DEFAULT_PIXEL_THREASHOLD = 25;
-
-	/**
-	 * Default check interval (in milliseconds, set to 1 second).
-	 */
-	public static final int DEFAULT_INTERVAL = 1000;
-
-	/**
-	 * Default percentage image area fraction threshold (set to 0.2%).
-	 */
-	public static final double DEFAULT_AREA_THREASHOLD = 0.2;
+	public static final int DEFAULT_INTERVAL = 500;
 
 	/**
 	 * Create new threads for detector internals.
-	 * 
+	 *
 	 * @author Bartosz Firyn (SarXos)
 	 */
 	private static final class DetectorThreadFactory implements ThreadFactory {
@@ -72,7 +59,7 @@ public class WebcamMotionDetector {
 
 	/**
 	 * Run motion detector.
-	 * 
+	 *
 	 * @author Bartosz Firyn (SarXos)
 	 */
 	private class Runner implements Runnable {
@@ -99,7 +86,7 @@ public class WebcamMotionDetector {
 
 	/**
 	 * Change motion to false after specified number of seconds.
-	 * 
+	 *
 	 * @author Bartosz Firyn (SarXos)
 	 */
 	private class Inverter implements Runnable {
@@ -120,7 +107,7 @@ public class WebcamMotionDetector {
 				delay = inertia != -1 ? inertia : 2 * interval;
 
 				if (lastMotionTimestamp + delay < System.currentTimeMillis()) {
-					motion.set(false);
+					motion = false;
 				}
 			}
 		}
@@ -144,13 +131,18 @@ public class WebcamMotionDetector {
 	/**
 	 * Is motion?
 	 */
-	private final AtomicBoolean motion = new AtomicBoolean(false);
+	private volatile boolean motion = false;
 
 	/**
 	 * Previously captured image.
 	 */
-	private BufferedImage previous = null;
+	private BufferedImage previousOriginal = null;
 
+	/**
+	 * Previously captured image with blur and gray filters applied.
+	 */
+	private BufferedImage previousModified = null;
+	
 	/**
 	 * Webcam to be used to detect motion.
 	 */
@@ -162,29 +154,9 @@ public class WebcamMotionDetector {
 	private volatile int interval = DEFAULT_INTERVAL;
 
 	/**
-	 * Pixel intensity threshold (0 - 255).
-	 */
-	private volatile int pixelThreshold = DEFAULT_PIXEL_THREASHOLD;
-
-	/**
-	 * Pixel intensity threshold (0 - 100).
-	 */
-	private volatile double areaThreshold = DEFAULT_AREA_THREASHOLD;
-
-	/**
 	 * How long motion is valid (in milliseconds). Default value is 2 seconds.
 	 */
 	private volatile int inertia = -1;
-
-	/**
-	 * Motion strength (0 = no motion, 100 = full image covered by motion).
-	 */
-	private double area = 0;
-
-	/**
-	 * Center of motion gravity.
-	 */
-	private Point cog = null;
 
 	/**
 	 * Timestamp when motion has been observed last time.
@@ -192,44 +164,44 @@ public class WebcamMotionDetector {
 	private volatile long lastMotionTimestamp = 0;
 
 	/**
-	 * Blur filter instance.
+	 * Implementation of motion detection algorithm.
 	 */
-	private final JHBlurFilter blur = new JHBlurFilter(6, 6, 1);
+	private final WebcamMotionDetectorAlgorithm detectorAlgorithm;
 
 	/**
-	 * Gray filter instance.
-	 */
-	private final JHGrayFilter gray = new JHGrayFilter();
-
-	/**
-	 * Create motion detector. Will open webcam if it is closed.
+	 * Create motion detector. Will open webcam if it is closed. 
 	 * 
+	 * @param webcam web camera instance
+	 * @param motion detector algorithm implementation 
+	 * @param interval the check interval
+	 */
+	public WebcamMotionDetector(Webcam webcam, WebcamMotionDetectorAlgorithm detectorAlgorithm, int interval) {
+		this.webcam = webcam;
+		this.detectorAlgorithm = detectorAlgorithm;
+		setInterval(interval);
+	}
+	
+	/**
+	 * Create motion detector. Will open webcam if it is closed. 
+	 * Uses WebcamMotionDetectorDefaultAlgorithm for motion detection. 
+	 *
 	 * @param webcam web camera instance
 	 * @param pixelThreshold intensity threshold (0 - 255)
 	 * @param areaThreshold percentage threshold of image covered by motion
-	 * @param inertia for how long motion is valid (seconds)
 	 * @param interval the check interval
 	 */
 	public WebcamMotionDetector(Webcam webcam, int pixelThreshold, double areaThreshold, int interval) {
-
-		this.webcam = webcam;
-
-		setPixelThreshold(pixelThreshold);
-		setAreaThreshold(areaThreshold);
-		setInterval(interval);
-
-		int w = webcam.getViewSize().width;
-		int h = webcam.getViewSize().height;
-
-		cog = new Point(w / 2, h / 2);
+		this(webcam, new WebcamMotionDetectorDefaultAlgorithm(pixelThreshold, areaThreshold), interval);
 	}
 
 	/**
 	 * Create motion detector with default parameter inertia = 0.
-	 * 
+	 * Uses WebcamMotionDetectorDefaultAlgorithm for motion detection. 
+	 *
 	 * @param webcam web camera instance
 	 * @param pixelThreshold intensity threshold (0 - 255)
-	 * @param areaThreshol percentage threshold of image covered by motion
+	 * @param areaThreshold percentage threshold of image covered by motion (0 -
+	 *            100)
 	 */
 	public WebcamMotionDetector(Webcam webcam, int pixelThreshold, double areaThreshold) {
 		this(webcam, pixelThreshold, areaThreshold, DEFAULT_INTERVAL);
@@ -237,22 +209,23 @@ public class WebcamMotionDetector {
 
 	/**
 	 * Create motion detector with default parameter inertia = 0.
-	 * 
+	 * Uses WebcamMotionDetectorDefaultAlgorithm for motion detection. 
+	 *
 	 * @param webcam web camera instance
 	 * @param pixelThreshold intensity threshold (0 - 255)
 	 */
 	public WebcamMotionDetector(Webcam webcam, int pixelThreshold) {
-		this(webcam, pixelThreshold, DEFAULT_AREA_THREASHOLD);
+		this(webcam, pixelThreshold, WebcamMotionDetectorDefaultAlgorithm.DEFAULT_AREA_THREASHOLD);
 	}
 
 	/**
 	 * Create motion detector with default parameters - threshold = 25, inertia
 	 * = 0.
-	 * 
+	 *
 	 * @param webcam web camera instance
 	 */
 	public WebcamMotionDetector(Webcam webcam) {
-		this(webcam, DEFAULT_PIXEL_THREASHOLD);
+		this(webcam, WebcamMotionDetectorDefaultAlgorithm.DEFAULT_PIXEL_THREASHOLD);
 	}
 
 	public void start() {
@@ -272,60 +245,38 @@ public class WebcamMotionDetector {
 
 	protected void detect() {
 
-		BufferedImage current = webcam.getImage();
-
-		current = blur.filter(current, null);
-		current = gray.filter(current, null);
-
-		int p = 0;
-
-		int cogX = 0;
-		int cogY = 0;
-
-		int w = current.getWidth();
-		int h = current.getHeight();
-
-		if (previous != null) {
-			for (int x = 0; x < w; x++) {
-				for (int y = 0; y < h; y++) {
-
-					int cpx = current.getRGB(x, y);
-					int ppx = previous.getRGB(x, y);
-					int pid = combinePixels(cpx, ppx) & 0x000000ff;
-
-					if (pid >= pixelThreshold) {
-						cogX += x;
-						cogY += y;
-						p += 1;
-					}
-				}
-			}
+		if (!webcam.isOpen()) {
+			motion = false;
+			return;
 		}
 
-		area = p * 100d / (w * h);
+		BufferedImage currentOriginal = webcam.getImage();
 
-		if (area >= areaThreshold) {
-
-			cog = new Point(cogX / p, cogY / p);
-
-			if (motion.compareAndSet(false, true)) {
-				lastMotionTimestamp = System.currentTimeMillis();
-			}
-
-			notifyMotionListeners();
-
-		} else {
-			cog = new Point(w / 2, h / 2);
+		if (currentOriginal == null) {
+			motion = false;
+			return;
 		}
 
-		previous = current;
+		BufferedImage currentModified = detectorAlgorithm.prepareImage(currentOriginal);
+		
+		boolean movementDetected = detectorAlgorithm.detect(previousModified, currentModified);
+
+		if (movementDetected) {
+			motion = true;
+			lastMotionTimestamp = System.currentTimeMillis();
+			notifyMotionListeners(currentOriginal);
+		}
+		
+		previousOriginal = currentOriginal;
+		previousModified = currentModified;
 	}
 
 	/**
 	 * Will notify all attached motion listeners.
+	 * @param image with the motion detected
 	 */
-	private void notifyMotionListeners() {
-		WebcamMotionEvent wme = new WebcamMotionEvent(this, area, cog);
+	private void notifyMotionListeners(BufferedImage currentOriginal) {
+		WebcamMotionEvent wme = new WebcamMotionEvent(this, previousOriginal, currentOriginal, detectorAlgorithm.getArea(), detectorAlgorithm.getCog(), detectorAlgorithm.getPoints());
 		for (WebcamMotionListener l : listeners) {
 			try {
 				l.motionDetected(wme);
@@ -337,7 +288,7 @@ public class WebcamMotionDetector {
 
 	/**
 	 * Add motion listener.
-	 * 
+	 *
 	 * @param l listener to add
 	 * @return true if listeners list has been changed, false otherwise
 	 */
@@ -354,7 +305,7 @@ public class WebcamMotionDetector {
 
 	/**
 	 * Removes motion listener.
-	 * 
+	 *
 	 * @param l motion listener to remove
 	 * @return true if listener was available on the list, false otherwise
 	 */
@@ -372,7 +323,7 @@ public class WebcamMotionDetector {
 	/**
 	 * Motion check interval in milliseconds. After motion is detected, it's
 	 * valid for time which is equal to value of 2 * interval.
-	 * 
+	 *
 	 * @param interval the new motion check interval (ms)
 	 * @see #DEFAULT_INTERVAL
 	 */
@@ -386,46 +337,38 @@ public class WebcamMotionDetector {
 	}
 
 	/**
-	 * Set pixel intensity difference threshold above which pixel is classified
-	 * as "moved". Minimum value is 0 and maximum is 255. Default value is 10.
-	 * This value is equal for all RGB components difference.
+	 * Sets pixelThreshold to the underlying detector algorithm, but only if the
+	 * algorithm is (or extends) WebcamMotionDetectorDefaultAlgorithm
+	 * 
+	 * @see WebcamMotionDetectorDefaultAlgorithm#setPixelThreshold(int)
 	 * 
 	 * @param threshold the pixel intensity difference threshold
-	 * @see #DEFAULT_PIXEL_THREASHOLD
 	 */
 	public void setPixelThreshold(int threshold) {
-		if (threshold < 0) {
-			throw new IllegalArgumentException("Pixel intensity threshold cannot be negative!");
+		if (detectorAlgorithm instanceof WebcamMotionDetectorDefaultAlgorithm) {
+			((WebcamMotionDetectorDefaultAlgorithm)detectorAlgorithm).setPixelThreshold(threshold);
 		}
-		if (threshold > 255) {
-			throw new IllegalArgumentException("Pixel intensity threshold cannot be higher than 255!");
-		}
-		this.pixelThreshold = threshold;
 	}
 
 	/**
-	 * Set percentage fraction of detected motion area threshold above which it
-	 * is classified as "moved". Minimum value for this is 0 and maximum is 100,
-	 * which corresponds to full image covered by spontaneous motion.
+	 * Sets areaThreshold to the underlying detector algorithm, but only if the
+	 * algorithm is (or extends) WebcamMotionDetectorDefaultAlgorithm
+	 * 
+	 * @see WebcamMotionDetectorDefaultAlgorithm#setAreaThreshold(double)
 	 * 
 	 * @param threshold the percentage fraction of image area
-	 * @see #DEFAULT_AREA_THREASHOLD
 	 */
 	public void setAreaThreshold(double threshold) {
-		if (threshold < 0) {
-			throw new IllegalArgumentException("Area fraction threshold cannot be negative!");
+		if (detectorAlgorithm instanceof WebcamMotionDetectorDefaultAlgorithm) {
+			((WebcamMotionDetectorDefaultAlgorithm)detectorAlgorithm).setAreaThreshold(threshold);
 		}
-		if (threshold > 100) {
-			throw new IllegalArgumentException("Area fraction threshold cannot be higher than 100!");
-		}
-		this.areaThreshold = threshold;
 	}
 
 	/**
 	 * Set motion inertia (time when motion is valid). If no value specified
 	 * this is set to 2 * interval. To reset to default value,
 	 * {@link #clearInertia()} method must be used.
-	 * 
+	 *
 	 * @param inertia the motion inertia time in milliseconds
 	 * @see #clearInertia()
 	 */
@@ -446,7 +389,7 @@ public class WebcamMotionDetector {
 
 	/**
 	 * Get attached webcam object.
-	 * 
+	 *
 	 * @return Attached webcam
 	 */
 	public Webcam getWebcam() {
@@ -457,74 +400,59 @@ public class WebcamMotionDetector {
 		if (!running.get()) {
 			LOG.warn("Motion cannot be detected when detector is not running!");
 		}
-		return motion.get();
+		return motion;
 	}
 
 	/**
 	 * Get percentage fraction of image covered by motion. 0 means no motion on
 	 * image and 100 means full image covered by spontaneous motion.
-	 * 
+	 *
 	 * @return Return percentage image fraction covered by motion
 	 */
 	public double getMotionArea() {
-		return area;
+		return detectorAlgorithm.getArea();
 	}
 
 	/**
 	 * Get motion center of gravity. When no motion is detected this value
 	 * points to the image center.
-	 * 
+	 *
 	 * @return Center of gravity point
 	 */
 	public Point getMotionCog() {
+		Point cog = detectorAlgorithm.getCog();
+		if (cog == null) {
+			// detectorAlgorithm hasn't been called so far - get image center
+			int w = webcam.getViewSize().width;
+			int h = webcam.getViewSize().height;
+			cog = new Point(w / 2, h / 2);
+		}
 		return cog;
 	}
 
-	private static int combinePixels(int rgb1, int rgb2) {
-
-		// first ARGB
-
-		int a1 = (rgb1 >> 24) & 0xff;
-		int r1 = (rgb1 >> 16) & 0xff;
-		int g1 = (rgb1 >> 8) & 0xff;
-		int b1 = rgb1 & 0xff;
-
-		// second ARGB
-
-		int a2 = (rgb2 >> 24) & 0xff;
-		int r2 = (rgb2 >> 16) & 0xff;
-		int g2 = (rgb2 >> 8) & 0xff;
-		int b2 = rgb2 & 0xff;
-
-		r1 = clamp(Math.abs(r1 - r2));
-		g1 = clamp(Math.abs(g1 - g2));
-		b1 = clamp(Math.abs(b1 - b2));
-
-		// in case if alpha is enabled (translucent image)
-
-		if (a1 != 0xff) {
-			a1 = a1 * 0xff / 255;
-			int a3 = (255 - a1) * a2 / 255;
-			r1 = clamp((r1 * a1 + r2 * a3) / 255);
-			g1 = clamp((g1 * a1 + g2 * a3) / 255);
-			b1 = clamp((b1 * a1 + b2 * a3) / 255);
-			a1 = clamp(a1 + a3);
-		}
-
-		return (a1 << 24) | (r1 << 16) | (g1 << 8) | b1;
-	}
-
 	/**
-	 * Clamp a value to the range 0..255
+	 * @return the detectorAlgorithm
 	 */
-	private static int clamp(int c) {
-		if (c < 0) {
-			return 0;
-		}
-		if (c > 255) {
-			return 255;
-		}
-		return c;
+	public WebcamMotionDetectorAlgorithm getDetectorAlgorithm() {
+		return detectorAlgorithm;
 	}
+
+
+    public void setMaxMotionPoints(int i){
+        detectorAlgorithm.setMaxPoints(i);
+    }
+
+    public int getMaxMotionPoints(){
+        return detectorAlgorithm.getMaxPoints();
+    }
+
+
+    public void setPointRange(int i){
+        detectorAlgorithm.setPointRange(i);
+    }
+
+    public int getPointRange(){
+        return detectorAlgorithm.getPointRange();
+    }
 
 }

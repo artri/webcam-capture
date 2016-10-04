@@ -37,7 +37,7 @@ public class WebcamUtils {
 	}
 
 	public static final void capture(Webcam webcam, String filename) {
-		if (filename.endsWith(".jpg")) {
+		if (!filename.endsWith(".jpg")) {
 			filename = filename + ".jpg";
 		}
 		capture(webcam, new File(filename));
@@ -45,7 +45,7 @@ public class WebcamUtils {
 
 	public static final void capture(Webcam webcam, String filename, String format) {
 		String ext = "." + format.toLowerCase();
-		if (!filename.startsWith(ext)) {
+		if (!filename.endsWith(ext)) {
 			filename = filename + ext;
 		}
 		capture(webcam, new File(filename), format);
@@ -57,7 +57,7 @@ public class WebcamUtils {
 
 	/**
 	 * Capture image as BYteBuffer.
-	 * 
+	 *
 	 * @param webcam the webcam from which image should be obtained
 	 * @param format the file format
 	 * @return Byte buffer
@@ -68,8 +68,9 @@ public class WebcamUtils {
 
 	/**
 	 * Get resource bundle for specific class.
-	 * 
+	 *
 	 * @param clazz the class for which resource bundle should be found
+	 * @param locale the {@link Locale} object
 	 * @return Resource bundle
 	 */
 	public static final ResourceBundle loadRB(Class<?> clazz, Locale locale) {

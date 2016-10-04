@@ -8,7 +8,11 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -17,22 +21,79 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.github.sarxos.webcam.WebcamDevice.BufferAccess;
+import com.github.sarxos.webcam.WebcamDevice.Configurable;
+import com.github.sarxos.webcam.WebcamUpdater.DefaultDelayCalculator;
+import com.github.sarxos.webcam.WebcamUpdater.DelayCalculator;
 import com.github.sarxos.webcam.ds.buildin.WebcamDefaultDevice;
 import com.github.sarxos.webcam.ds.buildin.WebcamDefaultDriver;
 import com.github.sarxos.webcam.ds.cgt.WebcamCloseTask;
 import com.github.sarxos.webcam.ds.cgt.WebcamDisposeTask;
+import com.github.sarxos.webcam.ds.cgt.WebcamGetBufferTask;
+import com.github.sarxos.webcam.ds.cgt.WebcamGetImageTask;
 import com.github.sarxos.webcam.ds.cgt.WebcamOpenTask;
 import com.github.sarxos.webcam.ds.cgt.WebcamReadBufferTask;
-import com.github.sarxos.webcam.ds.cgt.WebcamReadImageTask;
-import com.github.sarxos.webcam.util.ImageUtils;
 
 
 /**
  * Webcam class. It wraps webcam device obtained from webcam driver.
- * 
+ *
  * @author Bartosz Firyn (bfiryn)
  */
 public class Webcam {
+
+	/**
+	 * Class used to asynchronously notify all webcam listeners about new image available.
+	 *
+	 * @author Bartosz Firyn (sarxos)
+	 */
+	private static final class ImageNotification implements Runnable {
+
+		/**
+		 * Camera.
+		 */
+		private final Webcam webcam;
+
+		/**
+		 * Acquired image.
+		 */
+		private final BufferedImage image;
+
+		/**
+		 * Create new notification.
+		 *
+		 * @param webcam the webcam from which image has been acquired
+		 * @param image the acquired image
+		 */
+		public ImageNotification(Webcam webcam, BufferedImage image) {
+			this.webcam = webcam;
+			this.image = image;
+		}
+
+		@Override
+		public void run() {
+			if (image != null) {
+				WebcamEvent we = new WebcamEvent(WebcamEventType.NEW_IMAGE, webcam, image);
+				for (WebcamListener l : webcam.getWebcamListeners()) {
+					try {
+						l.webcamImageObtained(we);
+					} catch (Exception e) {
+						LOG.error(String.format("Notify image acquired, exception when calling listener %s", l.getClass()), e);
+					}
+				}
+			}
+		}
+	}
+
+	private final class NotificationThreadFactory implements ThreadFactory {
+
+		@Override
+		public Thread newThread(Runnable r) {
+			Thread t = new Thread(r, String.format("notificator-[%s]", getName()));
+			t.setUncaughtExceptionHandler(WebcamExceptionHandler.getInstance());
+			t.setDaemon(true);
+			return t;
+		}
+	}
 
 	/**
 	 * Logger instance.
@@ -117,18 +178,27 @@ public class Webcam {
 	/**
 	 * Webcam image updater.
 	 */
-	private WebcamUpdater updater = new WebcamUpdater(this);
+	private volatile WebcamUpdater updater = null;
 
 	/**
-	 * IMage transformer.
+	 * Image transformer.
 	 */
 	private volatile WebcamImageTransformer transformer = null;
 
+	/**
+	 * Lock which denies access to the given webcam when it's already in use by other webcam capture
+	 * API process or thread.
+	 */
 	private WebcamLock lock = null;
 
 	/**
+	 * Executor service for image notifications.
+	 */
+	private ExecutorService notificator = null;
+
+	/**
 	 * Webcam class.
-	 * 
+	 *
 	 * @param device - device to be used as webcam
 	 * @throws IllegalArgumentException when device argument is null
 	 */
@@ -141,14 +211,46 @@ public class Webcam {
 	}
 
 	/**
+	 * Asynchronously start new thread which will notify all webcam listeners about the new image
+	 * available.
+	 */
+	protected void notifyWebcamImageAcquired(BufferedImage image) {
+
+		// notify webcam listeners of new image available, do that only if there
+		// are any webcam listeners available because there is no sense to start
+		// additional threads for no purpose
+
+		if (getWebcamListenersCount() > 0) {
+			notificator.execute(new ImageNotification(this, image));
+		}
+	}
+
+	/**
 	 * Open the webcam in blocking (synchronous) mode.
-	 * 
-	 * @see #open(boolean)
+	 *
+	 * @return True if webcam has been open, false otherwise
+	 * @see #open(boolean, DelayCalculator)
+	 * @throws WebcamException when something went wrong
 	 */
 	public boolean open() {
 		return open(false);
 	}
 
+	/**
+	 * Open the webcam in either blocking (synchronous) or non-blocking
+	 * (asynchronous) mode. If the non-blocking mode is enabled the
+	 * DefaultDelayCalculator is used for calculating delay between two image
+	 * fetching.
+	 * 
+	 * @param async true for non-blocking mode, false for blocking
+	 * @return True if webcam has been open, false otherwise
+	 * @see #open(boolean, DelayCalculator)
+	 * @throws WebcamException when something went wrong
+	 */
+	public boolean open(boolean async) {
+		return open(async, new DefaultDelayCalculator());
+	}
+	
 	/**
 	 * Open the webcam in either blocking (synchronous) or non-blocking
 	 * (asynchronous) mode.The difference between those two modes lies in the
@@ -167,16 +269,27 @@ public class Webcam {
 	 * some cases, when two consecutive calls to get new image are executed more
 	 * often than webcam device can serve them, the same image instance will be
 	 * returned. User should use {@link #isImageNew()} method to distinguish if
-	 * returned image is not the same as the previous one.
+	 * returned image is not the same as the previous one. <br>
+	 * The background thread uses implementation of DelayCalculator interface to
+	 * calculate delay between two image fetching. Custom implementation may be
+	 * specified as parameter of this method. If the non-blocking mode is
+	 * enabled and no DelayCalculator is specified, DefaultDelayCalculator will
+	 * be used.
 	 * 
 	 * @param async true for non-blocking mode, false for blocking
+	 * @param delayCalculator responsible for calculating delay between two
+	 *            image fetching in non-blocking mode; It's ignored in blocking
+	 *            mode.
+	 * @return True if webcam has been open
+	 * @throws WebcamException when something went wrong
 	 */
-	public boolean open(boolean async) {
+	public boolean open(boolean async, DelayCalculator delayCalculator) {
 
 		if (open.compareAndSet(false, true)) {
 
-			assert updater != null;
 			assert lock != null;
+
+			notificator = Executors.newSingleThreadExecutor(new NotificationThreadFactory());
 
 			// lock webcam for other Java (only) processes
 
@@ -195,22 +308,34 @@ public class Webcam {
 			} catch (WebcamException e) {
 				lock.unlock();
 				open.set(false);
+				LOG.debug("Webcam exception when opening", e);
 				throw e;
 			}
 
 			LOG.debug("Webcam is now open {}", getName());
 
-			// setup non-blocking configuration
-
-			asynchronous = async;
-
-			if (async) {
-				updater.start();
-			}
-
 			// install shutdown hook
 
-			Runtime.getRuntime().addShutdownHook(hook = new WebcamShutdownHook(this));
+			try {
+				Runtime.getRuntime().addShutdownHook(hook = new WebcamShutdownHook(this));
+			} catch (IllegalStateException e) {
+
+				LOG.debug("Shutdown in progress, do not open device");
+				LOG.trace(e.getMessage(), e);
+
+				close();
+
+				return false;
+			}
+
+			// setup non-blocking configuration
+
+			if (asynchronous = async) {
+				if (updater == null) {
+					updater = new WebcamUpdater(this, delayCalculator);
+				}
+				updater.start();
+			}
 
 			// notify listeners
 
@@ -236,6 +361,8 @@ public class Webcam {
 
 	/**
 	 * Close the webcam.
+	 *
+	 * @return True if webcam has been open, false otherwise
 	 */
 	public boolean close() {
 
@@ -243,7 +370,6 @@ public class Webcam {
 
 			LOG.debug("Closing webcam {}", getName());
 
-			assert updater != null;
 			assert lock != null;
 
 			// close webcam
@@ -261,7 +387,9 @@ public class Webcam {
 			}
 
 			// stop updater
-			updater.stop();
+			if (asynchronous) {
+				updater.stop();
+			}
 
 			// remove shutdown hook (it's not more necessary)
 			removeShutdownHook();
@@ -284,6 +412,15 @@ public class Webcam {
 				}
 			}
 
+			notificator.shutdown();
+			while (!notificator.isTerminated()) {
+				try {
+					notificator.awaitTermination(100, TimeUnit.MILLISECONDS);
+				} catch (InterruptedException e) {
+					return false;
+				}
+			}
+
 			LOG.debug("Webcam {} has been closed", getName());
 
 		} else {
@@ -294,10 +431,10 @@ public class Webcam {
 	}
 
 	/**
-	 * Return underlying webcam device. Depending on the driver used to discover
-	 * devices, this method can return instances of different class. By default
-	 * {@link WebcamDefaultDevice} is returned when no external driver is used.
-	 * 
+	 * Return underlying webcam device. Depending on the driver used to discover devices, this
+	 * method can return instances of different class. By default {@link WebcamDefaultDevice} is
+	 * returned when no external driver is used.
+	 *
 	 * @return Underlying webcam device instance
 	 */
 	public WebcamDevice getDevice() {
@@ -306,8 +443,8 @@ public class Webcam {
 	}
 
 	/**
-	 * Completely dispose capture device. After this operation webcam cannot be
-	 * used any more and full reinstantiation is required.
+	 * Completely dispose capture device. After this operation webcam cannot be used any more and
+	 * full reinstantiation is required.
 	 */
 	protected void dispose() {
 
@@ -367,10 +504,9 @@ public class Webcam {
 	}
 
 	/**
-	 * TRansform image using image transformer. If image transformer has not
-	 * been set, this method return instance passed in the argument, without any
-	 * modifications.
-	 * 
+	 * TRansform image using image transformer. If image transformer has not been set, this method
+	 * return instance passed in the argument, without any modifications.
+	 *
 	 * @param image the image to be transformed
 	 * @return Transformed image (if transformer is set)
 	 */
@@ -386,7 +522,7 @@ public class Webcam {
 
 	/**
 	 * Is webcam open?
-	 * 
+	 *
 	 * @return true if open, false otherwise
 	 */
 	public boolean isOpen() {
@@ -395,7 +531,7 @@ public class Webcam {
 
 	/**
 	 * Get current webcam resolution in pixels.
-	 * 
+	 *
 	 * @return Webcam resolution (picture size) in pixels.
 	 */
 	public Dimension getViewSize() {
@@ -403,9 +539,8 @@ public class Webcam {
 	}
 
 	/**
-	 * Return list of supported view sizes. It can differ between vary webcam
-	 * data sources.
-	 * 
+	 * Return list of supported view sizes. It can differ between vary webcam data sources.
+	 *
 	 * @return Array of supported dimensions
 	 */
 	public Dimension[] getViewSizes() {
@@ -413,9 +548,9 @@ public class Webcam {
 	}
 
 	/**
-	 * Set custom resolution. If you are using this method you have to make sure
-	 * that your webcam device can support this specific resolution.
-	 * 
+	 * Set custom resolution. If you are using this method you have to make sure that your webcam
+	 * device can support this specific resolution.
+	 *
 	 * @param sizes the array of custom resolutions to be supported by webcam
 	 */
 	public void setCustomViewSizes(Dimension[] sizes) {
@@ -433,9 +568,9 @@ public class Webcam {
 	}
 
 	/**
-	 * Set new view size. New size has to exactly the same as one of the default
-	 * sized or exactly the same as one of the custom ones.
-	 * 
+	 * Set new view size. New size has to exactly the same as one of the default sized or exactly
+	 * the same as one of the custom ones.
+	 *
 	 * @param size the new view size to be set
 	 * @see Webcam#setCustomViewSizes(Dimension[])
 	 * @see Webcam#getViewSizes()
@@ -500,20 +635,18 @@ public class Webcam {
 	}
 
 	/**
-	 * Capture image from webcam and return it. Will return image object or null
-	 * if webcam is closed or has been already disposed by JVM.<br>
+	 * Capture image from webcam and return it. Will return image object or null if webcam is closed
+	 * or has been already disposed by JVM.<br>
 	 * <br>
 	 * <b>IMPORTANT NOTE!!!</b><br>
 	 * <br>
-	 * There are two possible behaviors of what webcam should do when you try to
-	 * get image and webcam is actually closed. Normally it will return null,
-	 * but there is a special flag which can be statically set to switch all
-	 * webcams to auto open mode. In this mode, webcam will be automatically
-	 * open, when you try to get image from closed webcam. Please be aware of
-	 * some side effects! In case of multi-threaded applications, there is no
-	 * guarantee that one thread will not try to open webcam even if it was
-	 * manually closed in different thread.
-	 * 
+	 * There are two possible behaviors of what webcam should do when you try to get image and
+	 * webcam is actually closed. Normally it will return null, but there is a special flag which
+	 * can be statically set to switch all webcams to auto open mode. In this mode, webcam will be
+	 * automatically open, when you try to get image from closed webcam. Please be aware of some
+	 * side effects! In case of multi-threaded applications, there is no guarantee that one thread
+	 * will not try to open webcam even if it was manually closed in different thread.
+	 *
 	 * @return Captured image or null if webcam is closed or disposed by JVM
 	 */
 	public BufferedImage getImage() {
@@ -525,8 +658,6 @@ public class Webcam {
 		long t1 = 0;
 		long t2 = 0;
 
-		assert updater != null;
-
 		if (asynchronous) {
 			return updater.getImage();
 		} else {
@@ -534,7 +665,7 @@ public class Webcam {
 			// get image
 
 			t1 = System.currentTimeMillis();
-			BufferedImage image = transform(new WebcamReadImageTask(driver, device).getImage());
+			BufferedImage image = transform(new WebcamGetImageTask(driver, device).getImage());
 			t2 = System.currentTimeMillis();
 
 			if (image == null) {
@@ -552,14 +683,13 @@ public class Webcam {
 
 			// notify webcam listeners about new image available
 
-			updater.notifyWebcamImageObtained(this, image);
+			notifyWebcamImageAcquired(image);
 
 			return image;
 		}
 	}
 
 	public boolean isImageNew() {
-		assert updater != null;
 		if (asynchronous) {
 			return updater.isImageNew();
 		}
@@ -567,7 +697,6 @@ public class Webcam {
 	}
 
 	public double getFPS() {
-		assert updater != null;
 		if (asynchronous) {
 			return updater.getFPS();
 		} else {
@@ -576,17 +705,14 @@ public class Webcam {
 	}
 
 	/**
-	 * Get RAW image ByteBuffer. It will always return buffer with 3 x 1 bytes
-	 * per each pixel, where RGB components are on (0, 1, 2) and color space is
-	 * sRGB.<br>
+	 * Get RAW image ByteBuffer. It will always return buffer with 3 x 1 bytes per each pixel, where
+	 * RGB components are on (0, 1, 2) and color space is sRGB.<br>
 	 * <br>
-	 * 
 	 * <b>IMPORTANT!</b><br>
-	 * Some drivers can return direct ByteBuffer, so there is no guarantee that
-	 * underlying bytes will not be released in next read image operation.
-	 * Therefore, to avoid potential bugs you should convert this ByteBuffer to
-	 * bytes array before you fetch next image.
-	 * 
+	 * Some drivers can return direct ByteBuffer, so there is no guarantee that underlying bytes
+	 * will not be released in next read image operation. Therefore, to avoid potential bugs you
+	 * should convert this ByteBuffer to bytes array before you fetch next image.
+	 *
 	 * @return Byte buffer
 	 */
 	public ByteBuffer getImageBytes() {
@@ -603,20 +729,63 @@ public class Webcam {
 		// buffers, just convert image to RGB byte array
 
 		if (device instanceof BufferAccess) {
-			return new WebcamReadBufferTask(driver, device).getBuffer();
+			return new WebcamGetBufferTask(driver, device).getBuffer();
 		} else {
-			BufferedImage image = getImage();
-			if (image != null) {
-				return ByteBuffer.wrap(ImageUtils.toRawByteArray(image));
-			} else {
-				return null;
-			}
+			throw new IllegalStateException(String.format("Driver %s does not support buffer access", driver.getClass().getName()));
 		}
 	}
 
 	/**
-	 * Is webcam ready to be read.
+	 * Get RAW image ByteBuffer. It will always return buffer with 3 x 1 bytes per each pixel, where
+	 * RGB components are on (0, 1, 2) and color space is sRGB.<br>
+	 * <br>
+	 * <b>IMPORTANT!</b><br>
+	 * Some drivers can return direct ByteBuffer, so there is no guarantee that underlying bytes
+	 * will not be released in next read image operation. Therefore, to avoid potential bugs you
+	 * should convert this ByteBuffer to bytes array before you fetch next image.
+	 *
+	 * @param target the target {@link ByteBuffer} object to copy data into
+	 */
+	public void getImageBytes(ByteBuffer target) {
+
+		if (!isReady()) {
+			return;
+		}
+
+		assert driver != null;
+		assert device != null;
+
+		// some devices can support direct image buffers, and for those call
+		// processor task, and for those which does not support direct image
+		// buffers, just convert image to RGB byte array
+
+		if (device instanceof BufferAccess) {
+			new WebcamReadBufferTask(driver, device, target).readBuffer();
+		} else {
+			throw new IllegalStateException(String.format("Driver %s does not support buffer access", driver.getClass().getName()));
+		}
+	}
+
+	/**
+	 * If the underlying device implements Configurable interface, specified
+	 * parameters are passed to it. May be called before the open method or
+	 * later in dependence of the device implementation.
 	 * 
+	 * @param parameters - Map of parameters changing device defaults
+	 * @see Configurable
+	 */
+	public void setParameters(Map<String, ?> parameters) {
+		WebcamDevice device = getDevice();
+		if (device instanceof Configurable) {
+			((Configurable) device).setParameters(parameters);
+		} else {
+			LOG.debug("Webcam device {} is not configurable", device);
+		}
+	}
+	
+	/**
+	 * Is webcam ready to be read.
+	 *
 	 * @return True if ready, false otherwise
 	 */
 	private boolean isReady() {
@@ -641,10 +810,9 @@ public class Webcam {
 	}
 
 	/**
-	 * Get list of webcams to use. This method will wait predefined time
-	 * interval for webcam devices to be discovered. By default this time is set
-	 * to 1 minute.
-	 * 
+	 * Get list of webcams to use. This method will wait predefined time interval for webcam devices
+	 * to be discovered. By default this time is set to 1 minute.
+	 *
 	 * @return List of webcams existing in the system
 	 * @throws WebcamException when something is wrong
 	 * @see Webcam#getWebcams(long, TimeUnit)
@@ -662,11 +830,12 @@ public class Webcam {
 	}
 
 	/**
-	 * Get list of webcams to use. This method will wait given time interval for
-	 * webcam devices to be discovered. Time argument is given in milliseconds.
-	 * 
+	 * Get list of webcams to use. This method will wait given time interval for webcam devices to
+	 * be discovered. Time argument is given in milliseconds.
+	 *
 	 * @param timeout the time to wait for webcam devices to be discovered
 	 * @return List of webcams existing in the ssytem
+	 * @throws TimeoutException when timeout occurs
 	 * @throws WebcamException when something is wrong
 	 * @throws IllegalArgumentException when timeout is negative
 	 * @see Webcam#getWebcams(long, TimeUnit)
@@ -679,9 +848,9 @@ public class Webcam {
 	}
 
 	/**
-	 * Get list of webcams to use. This method will wait given time interval for
-	 * webcam devices to be discovered.
-	 * 
+	 * Get list of webcams to use. This method will wait given time interval for webcam devices to
+	 * be discovered.
+	 *
 	 * @param timeout the devices discovery timeout
 	 * @param tunit the time unit
 	 * @return List of webcams
@@ -712,7 +881,7 @@ public class Webcam {
 
 	/**
 	 * Will discover and return first webcam available in the system.
-	 * 
+	 *
 	 * @return Default webcam (first from the list)
 	 * @throws WebcamException if something is really wrong
 	 * @see Webcam#getWebcams()
@@ -730,7 +899,7 @@ public class Webcam {
 
 	/**
 	 * Will discover and return first webcam available in the system.
-	 * 
+	 *
 	 * @param timeout the webcam discovery timeout (1 minute by default)
 	 * @return Default webcam (first from the list)
 	 * @throws TimeoutException when discovery timeout has been exceeded
@@ -747,7 +916,7 @@ public class Webcam {
 
 	/**
 	 * Will discover and return first webcam available in the system.
-	 * 
+	 *
 	 * @param timeout the webcam discovery timeout (1 minute by default)
 	 * @param tunit the time unit
 	 * @return Default webcam (first from the list)
@@ -779,10 +948,10 @@ public class Webcam {
 	}
 
 	/**
-	 * Get webcam name (device name). The name of device depends on the value
-	 * returned by the underlying data source, so in some cases it can be
-	 * human-readable value and sometimes it can be some strange number.
-	 * 
+	 * Get webcam name (device name). The name of device depends on the value returned by the
+	 * underlying data source, so in some cases it can be human-readable value and sometimes it can
+	 * be some strange number.
+	 *
 	 * @return Name
 	 */
 	public String getName() {
@@ -797,8 +966,9 @@ public class Webcam {
 
 	/**
 	 * Add webcam listener.
-	 * 
+	 *
 	 * @param l the listener to be added
+	 * @return True if listener has been added, false if it was already there
 	 * @throws IllegalArgumentException when argument is null
 	 */
 	public boolean addWebcamListener(WebcamListener l) {
@@ -827,7 +997,7 @@ public class Webcam {
 
 	/**
 	 * Removes webcam listener.
-	 * 
+	 *
 	 * @param l the listener to be removed
 	 * @return True if listener has been removed, false otherwise
 	 */
@@ -840,7 +1010,7 @@ public class Webcam {
 	 * Return webcam driver. Perform search if necessary.<br>
 	 * <br>
 	 * <b>This method is not thread-safe!</b>
-	 * 
+	 *
 	 * @return Webcam driver
 	 */
 	public static synchronized WebcamDriver getDriver() {
@@ -865,7 +1035,7 @@ public class Webcam {
 	 * Set new video driver to be used by webcam.<br>
 	 * <br>
 	 * <b>This method is not thread-safe!</b>
-	 * 
+	 *
 	 * @param wd new webcam driver to be used (e.g. LtiCivil, JFM, FMJ, QTJ)
 	 * @throws IllegalArgumentException when argument is null
 	 */
@@ -883,12 +1053,12 @@ public class Webcam {
 	}
 
 	/**
-	 * Set new video driver class to be used by webcam. Class given in the
-	 * argument shall extend {@link WebcamDriver} interface and should have
-	 * public default constructor, so instance can be created by reflection.<br>
+	 * Set new video driver class to be used by webcam. Class given in the argument shall extend
+	 * {@link WebcamDriver} interface and should have public default constructor, so instance can be
+	 * created by reflection.<br>
 	 * <br>
 	 * <b>This method is not thread-safe!</b>
-	 * 
+	 *
 	 * @param driverClass new video driver class to use
 	 * @throws IllegalArgumentException when argument is null
 	 */
@@ -930,7 +1100,7 @@ public class Webcam {
 
 	/**
 	 * Register new webcam video driver.
-	 * 
+	 *
 	 * @param clazz webcam video driver class
 	 * @throws IllegalArgumentException when argument is null
 	 */
@@ -944,7 +1114,7 @@ public class Webcam {
 
 	/**
 	 * Register new webcam video driver.
-	 * 
+	 *
 	 * @param clazzName webcam video driver class name
 	 * @throws IllegalArgumentException when argument is null
 	 */
@@ -958,12 +1128,11 @@ public class Webcam {
 	/**
 	 * <b>CAUTION!!!</b><br>
 	 * <br>
-	 * This is experimental feature to be used mostly in in development phase.
-	 * After you set handle term signal to true, and fetch capture devices,
-	 * Webcam Capture API will listen for TERM signal and try to close all
-	 * devices after it has been received. <b>This feature can be unstable on
-	 * some systems!</b>
-	 * 
+	 * This is experimental feature to be used mostly in in development phase. After you set handle
+	 * term signal to true, and fetch capture devices, Webcam Capture API will listen for TERM
+	 * signal and try to close all devices after it has been received. <b>This feature can be
+	 * unstable on some systems!</b>
+	 *
 	 * @param on signal handling will be enabled if true, disabled otherwise
 	 */
 	public static void setHandleTermSignal(boolean on) {
@@ -975,7 +1144,7 @@ public class Webcam {
 
 	/**
 	 * Is TERM signal handler enabled.
-	 * 
+	 *
 	 * @return True if enabled, false otherwise
 	 */
 	public static boolean isHandleTermSignal() {
@@ -983,13 +1152,12 @@ public class Webcam {
 	}
 
 	/**
-	 * Switch all webcams to auto open mode. In this mode, each webcam will be
-	 * automatically open whenever user will try to get image from instance
-	 * which has not yet been open. Please be aware of some side effects! In
-	 * case of multi-threaded applications, there is no guarantee that one
-	 * thread will not try to open webcam even if it was manually closed in
-	 * different thread.
-	 * 
+	 * Switch all webcams to auto open mode. In this mode, each webcam will be automatically open
+	 * whenever user will try to get image from instance which has not yet been open. Please be
+	 * aware of some side effects! In case of multi-threaded applications, there is no guarantee
+	 * that one thread will not try to open webcam even if it was manually closed in different
+	 * thread.
+	 *
 	 * @param on true to enable, false to disable
 	 */
 	public static void setAutoOpenMode(boolean on) {
@@ -997,13 +1165,11 @@ public class Webcam {
 	}
 
 	/**
-	 * Is auto open mode enabled. Auto open mode will will automatically open
-	 * webcam whenever user will try to get image from instance which has not
-	 * yet been open. Please be aware of some side effects! In case of
-	 * multi-threaded applications, there is no guarantee that one thread will
-	 * not try to open webcam even if it was manually closed in different
-	 * thread.
-	 * 
+	 * Is auto open mode enabled. Auto open mode will will automatically open webcam whenever user
+	 * will try to get image from instance which has not yet been open. Please be aware of some side
+	 * effects! In case of multi-threaded applications, there is no guarantee that one thread will
+	 * not try to open webcam even if it was manually closed in different thread.
+	 *
 	 * @return True if mode is enabled, false otherwise
 	 */
 	public static boolean isAutoOpenMode() {
@@ -1012,7 +1178,7 @@ public class Webcam {
 
 	/**
 	 * Add new webcam discovery listener.
-	 * 
+	 *
 	 * @param l the listener to be added
 	 * @return True, if listeners list size has been changed, false otherwise
 	 * @throws IllegalArgumentException when argument is null
@@ -1030,7 +1196,7 @@ public class Webcam {
 
 	/**
 	 * Remove discovery listener
-	 * 
+	 *
 	 * @param l the listener to be removed
 	 * @return True if listeners list contained the specified element
 	 */
@@ -1040,7 +1206,7 @@ public class Webcam {
 
 	/**
 	 * Return discovery service.
-	 * 
+	 *
 	 * @return Discovery service
 	 */
 	public static synchronized WebcamDiscoveryService getDiscoveryService() {
@@ -1052,7 +1218,7 @@ public class Webcam {
 
 	/**
 	 * Return discovery service without creating it if not exists.
-	 * 
+	 *
 	 * @return Discovery service or null if not yet created
 	 */
 	public static synchronized WebcamDiscoveryService getDiscoveryServiceRef() {
@@ -1061,7 +1227,7 @@ public class Webcam {
 
 	/**
 	 * Return image transformer.
-	 * 
+	 *
 	 * @return Transformer instance
 	 */
 	public WebcamImageTransformer getImageTransformer() {
@@ -1070,7 +1236,7 @@ public class Webcam {
 
 	/**
 	 * Set image transformer.
-	 * 
+	 *
 	 * @param transformer the transformer to be set
 	 */
 	public void setImageTransformer(WebcamImageTransformer transformer) {
@@ -1079,14 +1245,19 @@ public class Webcam {
 
 	/**
 	 * Return webcam lock.
-	 * 
+	 *
 	 * @return Webcam lock
 	 */
 	public WebcamLock getLock() {
 		return lock;
 	}
 
-	public static void shutdown() {
+	/**
+	 * Shutdown webcam framework. This method should be used <b>ONLY</b> when you
+	 * are exiting JVM, but please <b>do not invoke it</b> if you really don't
+	 * need to.
+	 */
+	protected static void shutdown() {
 
 		// stop discovery service
 		WebcamDiscoveryService discovery = getDiscoveryServiceRef();
@@ -1096,6 +1267,29 @@ public class Webcam {
 
 		// stop processor
 		WebcamProcessor.getInstance().shutdown();
+	}
 
+	/**
+	 * Return webcam with given name or null if no device with given name has
+	 * been found. Please note that specific webcam name may depend on the order
+	 * it was connected to the USB port (e.g. /dev/video0 vs /dev/video1).
+	 * 
+	 * @param name the webcam name
+	 * @return Webcam with given name or null if not found
+	 * @throws IllegalArgumentException when name is null
+	 */
+	public static Webcam getWebcamByName(String name) {
+
+		if (name == null) {
+			throw new IllegalArgumentException("Webcam name cannot be null");
+		}
+
+		for (Webcam webcam : getWebcams()) {
+			if (webcam.getName().equals(name)) {
+				return webcam;
+			}
+		}
+
+		return null;
 	}
 }

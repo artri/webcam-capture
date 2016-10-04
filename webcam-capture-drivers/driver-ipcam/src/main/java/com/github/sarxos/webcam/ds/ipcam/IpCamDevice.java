@@ -19,9 +19,12 @@ import org.apache.http.HttpResponse;
 import org.apache.http.auth.AuthScope;
 import org.apache.http.client.AuthCache;
 import org.apache.http.client.methods.HttpGet;
+import org.apache.http.client.methods.HttpHead;
 import org.apache.http.client.protocol.ClientContext;
 import org.apache.http.impl.auth.BasicScheme;
 import org.apache.http.impl.client.BasicAuthCache;
+import org.apache.http.params.CoreProtocolPNames;
+import org.apache.http.params.HttpConnectionParams;
 import org.apache.http.protocol.BasicHttpContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -92,6 +95,8 @@ public class IpCamDevice implements WebcamDevice {
 			}
 		}
 
+		private volatile boolean processing = true;
+
 		@Override
 		public void run() {
 
@@ -105,19 +110,26 @@ public class IpCamDevice implements WebcamDevice {
 
 					LOG.trace("Reading MJPEG frame");
 
-					BufferedImage image = stream.readFrame();
-
-					if (image != null) {
-						this.image = image;
+					processing = false;
+					try {
+						BufferedImage image = stream.readFrame();
+						if (image != null) {
+							this.image = image;
+						} else {
+							LOG.error("No image received from the stream");
+						}
+					} finally {
 						synchronized (lock) {
 							lock.notifyAll();
 						}
+						processing = false;
 					}
 
 				} catch (IOException e) {
 
 					// case when someone manually closed stream, do not log
 					// exception, this is normal behavior
+
 					if (stream.isClosed()) {
 						LOG.debug("Stream already closed, returning");
 						return;
@@ -163,8 +175,10 @@ public class IpCamDevice implements WebcamDevice {
 			}
 			if (image == null) {
 				try {
-					synchronized (lock) {
-						lock.wait();
+					while (processing) {
+						synchronized (lock) {
+							lock.wait();
+						}
 					}
 				} catch (InterruptedException e) {
 					throw new WebcamException("Reader thread interrupted", e);
@@ -193,7 +207,7 @@ public class IpCamDevice implements WebcamDevice {
 
 	private Dimension[] sizes = null;
 	private Dimension size = null;
-
+	
 	public IpCamDevice(String name, String url, IpCamMode mode) throws MalformedURLException {
 		this(name, new URL(url), mode, null);
 	}
@@ -221,6 +235,10 @@ public class IpCamDevice implements WebcamDevice {
 			AuthScope scope = new AuthScope(new HttpHost(url.getHost().toString()));
 			client.getCredentialsProvider().setCredentials(scope, auth);
 		}
+	}
+
+	public IpCamHttpClient getClient() {
+		return client;
 	}
 
 	protected static final URL toURL(String url) {
@@ -294,7 +312,11 @@ public class IpCamDevice implements WebcamDevice {
 	public synchronized BufferedImage getImage() {
 
 		if (!open) {
-			throw new WebcamException("IpCam device not open");
+			return null;
+		}
+
+		if (mode == null) {
+			throw new IllegalStateException("Camera mode cannot be null!");
 		}
 
 		switch (mode) {
@@ -391,6 +413,40 @@ public class IpCamDevice implements WebcamDevice {
 				}
 			}
 		}
+	}
+
+	/**
+	 * This method will send HTTP HEAD request to the camera URL to check
+	 * whether it's online or offline. It's online when this request succeed and
+	 * it's offline if any exception occurs or response code is 404 Not Found.
+	 * 
+	 * @return True if camera is online, false otherwise
+	 */
+	public boolean isOnline() {
+
+		LOG.debug("Checking online status for {} at {}", getName(), getURL());
+
+		URI uri = null;
+		try {
+			uri = getURL().toURI();
+		} catch (URISyntaxException e) {
+			throw new WebcamException(String.format("Incorrect URI syntax '%s'", uri), e);
+		}
+
+		HttpHead head = new HttpHead(uri);
+		
+		HttpResponse response = null;
+		try {
+			response = client.execute(head);
+		} catch (Exception e) {
+			return false;
+		} finally {
+			if (head != null) {
+				head.releaseConnection();
+			}
+		}
+
+		return response.getStatusLine().getStatusCode() != 404;
 	}
 
 	@Override

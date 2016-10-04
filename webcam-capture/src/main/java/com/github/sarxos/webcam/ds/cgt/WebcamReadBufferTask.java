@@ -2,9 +2,6 @@ package com.github.sarxos.webcam.ds.cgt;
 
 import java.nio.ByteBuffer;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import com.github.sarxos.webcam.WebcamDevice;
 import com.github.sarxos.webcam.WebcamDevice.BufferAccess;
 import com.github.sarxos.webcam.WebcamDriver;
@@ -13,22 +10,20 @@ import com.github.sarxos.webcam.WebcamTask;
 
 public class WebcamReadBufferTask extends WebcamTask {
 
-	private static final Logger LOG = LoggerFactory.getLogger(WebcamReadBufferTask.class);
+	private volatile ByteBuffer target = null;
 
-	private volatile ByteBuffer buffer = null;
-
-	public WebcamReadBufferTask(WebcamDriver driver, WebcamDevice device) {
+	public WebcamReadBufferTask(WebcamDriver driver, WebcamDevice device, ByteBuffer target) {
 		super(driver, device);
+		this.target = target;
 	}
 
-	public ByteBuffer getBuffer() {
+	public ByteBuffer readBuffer() {
 		try {
 			process();
 		} catch (InterruptedException e) {
-			LOG.debug("Image buffer request interrupted", e);
 			return null;
 		}
-		return buffer;
+		return target;
 	}
 
 	@Override
@@ -43,6 +38,6 @@ public class WebcamReadBufferTask extends WebcamTask {
 			return;
 		}
 
-		buffer = ((BufferAccess) device).getImageBytes();
+		((BufferAccess) device).getImageBytes(target);
 	}
 }

@@ -5,3 +5,11 @@ target
 **/*/.settings
 **/*/target
 **/*/dependency-reduced-pom.xml
+pom.xml~
+.project
+.classpath
+README.md~
+*.iml
+.idea/
+*.ipr
+*.iws

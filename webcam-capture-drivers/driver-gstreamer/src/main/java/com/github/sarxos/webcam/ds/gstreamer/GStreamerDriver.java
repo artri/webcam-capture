@@ -15,7 +15,7 @@ import org.slf4j.LoggerFactory;
 import com.github.sarxos.webcam.WebcamDevice;
 import com.github.sarxos.webcam.WebcamDriver;
 import com.github.sarxos.webcam.WebcamException;
-import com.github.sarxos.webcam.ds.gstreamer.impl.VideoDeviceFilenameFilter;
+import com.github.sarxos.webcam.util.NixVideoDevUtils;
 import com.sun.jna.NativeLibrary;
 import com.sun.jna.Platform;
 
@@ -100,29 +100,30 @@ public class GStreamerDriver implements WebcamDriver {
 		String srcname = null;
 		if (Platform.isWindows()) {
 			srcname = "dshowvideosrc";
-		} else {
+		} else if (Platform.isLinux()) {
 			srcname = "v4l2src";
+		} else if (Platform.isMac()) {
+			srcname = "qtkitvideosrc";
 		}
 
-		Element dshowsrc = ElementFactory.make(srcname, "source");
+		Element src = ElementFactory.make(srcname, "source");
 
 		try {
 			if (Platform.isWindows()) {
-				PropertyProbe probe = PropertyProbe.wrap(dshowsrc);
+				PropertyProbe probe = PropertyProbe.wrap(src);
 				for (Object name : probe.getValues("device-name")) {
 					devices.add(new GStreamerDevice(name.toString()));
 				}
 			} else if (Platform.isLinux()) {
-				VideoDeviceFilenameFilter vfilter = new VideoDeviceFilenameFilter();
-				for (File vfile : vfilter.getVideoFiles()) {
+				for (File vfile : NixVideoDevUtils.getVideoFiles()) {
 					devices.add(new GStreamerDevice(vfile));
 				}
 			} else {
 				throw new RuntimeException("Platform unsupported by GStreamer capture driver");
 			}
 		} finally {
-			if (dshowsrc != null) {
-				dshowsrc.dispose();
+			if (src != null) {
+				src.dispose();
 			}
 		}
 
